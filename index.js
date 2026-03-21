@@ -1,40 +1,28 @@
 const { Client, RemoteAuth } = require('whatsapp-web.js');
 const express = require('express');
 const { PostgresStore } = require('wwebjs-postgres');
+const QRCode = require('qrcode');
 
 const app = express();
 app.use(express.json());
 
+let latestQr = null;
 let isReady = false;
 
-// 1. Verificación de la URL de la base de datos
-const dbUrl = process.env.DATABASE_URL;
-if (!dbUrl) {
-    console.error('❌ ERROR: No se encontró la variable DATABASE_URL en Railway.');
-    process.exit(1);
-}
-
-// 2. Configuración de conexión
+// 1. Configuración de la base de datos
 const dbConfig = {
-    connectionString: dbUrl,
+    connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
 };
 
-// 3. Inicializamos el Store (Aquí estaba el error, ahora está corregido)
-const store = new PostgresStore({ 
-    connectionConfig: dbConfig 
-});
+const store = new PostgresStore({ connectionConfig: dbConfig });
 
-// 4. Configuración del Cliente de WhatsApp
+// 2. Cliente de WhatsApp con Persistencia
 const client = new Client({
     authStrategy: new RemoteAuth({
         store: store,
         backupSyncIntervalMs: 300000
     }),
-    webVersionCache: {
-        type: 'remote',
-        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
-    },
     puppeteer: {
         handleSIGINT: false,
         args: [
@@ -42,60 +30,96 @@ const client = new Client({
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
             '--single-process',
-            '--no-zygote',
-            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            '--no-zygote'
         ],
         executablePath: '/usr/bin/google-chrome-stable'
     }
 });
 
-client.on('ready', () => {
-    isReady = true;
-    console.log('✅ ¡WhatsApp Conectado y Listo!');
+// 3. Captura del QR
+client.on('qr', async (qr) => {
+    isReady = false;
+    console.log('✨ Nuevo QR generado. List para escanear.');
+    // Convertimos el texto del QR en una imagen Base64 para mostrarla en la web
+    latestQr = await QRCode.toDataURL(qr);
 });
 
-// RUTA PARA VINCULAR (Con el delay de seguridad para evitar el error 't')
-app.get('/vincular', async (req, res) => {
-    const phone = req.query.phone;
-    if (!phone) return res.send('Falta el número: /vincular?phone=58412XXXXXXX');
-    if (isReady) return res.send('✅ Ya estás conectado.');
+client.on('ready', () => {
+    isReady = true;
+    latestQr = null;
+    console.log('✅ ¡WhatsApp Conectado Exitosamente!');
+});
 
-    console.log(`⏳ Iniciando vinculación para ${phone}...`);
+client.on('authenticated', () => console.log('🔓 Sesión Autenticada'));
+client.on('auth_failure', (msg) => console.error('❌ Error de Autenticación:', msg));
 
-    try {
-        // Esperamos 10 segundos para que la página cargue en Railway
-        await new Promise(resolve => setTimeout(resolve, 10000));
-        
-        console.log('📲 Solicitando código de 8 dígitos...');
-        const code = await client.requestPairingCode(phone);
-        
-        res.send(`
-            <div style="text-align:center; font-family:sans-serif; margin-top:50px;">
-                <h1 style="color:#128c7e;">Código de Vinculación</h1>
-                <div style="font-size:3.5rem; font-weight:bold; background:#e1f5fe; padding:20px; display:inline-block; border-radius:10px; border:3px solid #01579b; font-family:monospace;">
-                    ${code}
-                </div>
-                <p style="margin-top:20px;">Introduce este código en tu celular ahora mismo.</p>
-                <button onclick="location.reload()" style="margin-top:20px; padding:10px; cursor:pointer;">Generar otro código</button>
+// --- RUTAS WEB ---
+
+// Página para ver el QR
+app.get('/qr', (req, res) => {
+    if (isReady) {
+        return res.send(`
+            <div style="text-align:center; font-family:sans-serif; margin-top:100px;">
+                <h1 style="color:#128c7e;">✅ WhatsApp Conectado</h1>
+                <p>Tu sistema de CrumbCore ya está operativo.</p>
+                <a href="/status">Ver Estado</a>
             </div>
         `);
-    } catch (err) {
-        console.error('Error al generar código:', err.message);
-        res.send(`<h2>Error: ${err.message}</h2><p>Espera 10 segundos y recarga la página.</p>`);
+    }
+
+    if (latestQr) {
+        res.send(`
+            <html>
+                <head>
+                    <meta http-equiv="refresh" content="20">
+                    <title>Vincular WhatsApp - CrumbCore</title>
+                    <style>
+                        body { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; font-family:sans-serif; background:#f0f2f5; margin:0; }
+                        .card { background:white; padding:40px; border-radius:20px; box-shadow:0 10px 25px rgba(0,0,0,0.1); text-align:center; }
+                        img { width:300px; margin:20px 0; border: 10px solid #fff; box-shadow: 0 0 10px rgba(0,0,0,0.05); }
+                        .loader { color: #666; font-size: 0.9rem; }
+                    </style>
+                </head>
+                <body>
+                    <div class="card">
+                        <h2 style="color:#128c7e;">Vincular WhatsApp</h2>
+                        <p>Escanea este código desde WhatsApp > Dispositivos vinculados</p>
+                        <img src="${latestQr}">
+                        <p class="loader">La página se refresca automáticamente cada 20s...</p>
+                    </div>
+                </body>
+            </html>
+        `);
+    } else {
+        res.send(`
+            <div style="text-align:center; font-family:sans-serif; margin-top:100px;">
+                <h2>Cargando WhatsApp Web...</h2>
+                <p>Espera unos segundos y refresca la página.</p>
+                <script>setTimeout(() => location.reload(), 5000);</script>
+            </div>
+        `);
     }
 });
 
+app.get('/status', (req, res) => {
+    res.json({ 
+        connected: isReady, 
+        message: isReady ? "WhatsApp is ready" : "WhatsApp is disconnected" 
+    });
+});
+
+// Endpoint para que Django envíe mensajes
 app.post('/send', async (req, res) => {
-    if (!isReady) return res.status(503).json({ error: 'WhatsApp Offline' });
+    if (!isReady) return res.status(503).json({ error: 'WhatsApp no está listo' });
+    const { phone, message } = req.body;
     try {
-        await client.sendMessage(`${req.body.phone}@c.us`, req.body.message);
-        res.json({ status: 'ok' });
-    } catch (e) { res.status(500).json({ error: e.message }); }
+        const chatId = `${phone}@c.us`;
+        await client.sendMessage(chatId, message);
+        res.json({ status: 'sent' });
+    } catch (e) {
+        res.status(500).json({ error: e.message });
+    }
 });
 
 client.initialize();
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`🚀 Microservicio escuchando en el puerto ${PORT}`);
-});
+app.listen(process.env.PORT || 3000, () => console.log('🚀 Microservicio QR listo en Railway'));
