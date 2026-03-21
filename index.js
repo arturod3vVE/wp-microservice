@@ -115,17 +115,18 @@ app.get('/qr', (req, res) => {
     }
 });
 
+// Endpoint MODIFICADO para limpiar el número antes de encolar
 app.post('/send', (req, res) => {
     if (!isReady) return res.status(503).json({ error: 'WhatsApp Offline' });
     
     const { phone, message } = req.body;
     if (!phone || !message) return res.status(400).json({ error: 'Faltan datos' });
 
-    // Enviar a la cola
-    messageQueue.push({ phone, message });
+    const cleanPhone = phone.replace(/\D/g, '');
+
+    messageQueue.push({ phone: cleanPhone, message });
     processQueue();
 
-    // Responder rápido a Django
     res.status(200).json({ 
         status: 'queued', 
         detail: `Mensaje recibido. Posición en cola: ${messageQueue.length}` 
