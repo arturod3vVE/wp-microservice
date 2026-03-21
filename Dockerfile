@@ -1,9 +1,9 @@
 # Usar una imagen ligera de Node.js
 FROM node:18-slim
 
-# Instalar dependencias de Chromium (Necesario para whatsapp-web.js en Linux)
+# 1. Instalar dependencias de Chromium Y AGREGAR GIT
 RUN apt-get update \
-    && apt-get install -y wget gnupg \
+    && apt-get install -y wget gnupg git \
     && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | apt-key add - \
     && sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list' \
     && apt-get update \
@@ -16,6 +16,8 @@ WORKDIR /app
 
 # Copiar archivos e instalar librerías de Node
 COPY package*.json ./
+
+# Ahora npm install podrá usar git sin problemas
 RUN npm install
 
 # Copiar el resto del código
