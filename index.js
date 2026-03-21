@@ -5,27 +5,63 @@ const QRCode = require('qrcode');
 const app = express();
 app.use(express.json());
 
-let latestQr = null;
 let isReady = false;
+let latestQr = null;
 
-// Usamos LocalAuth apuntando al Volumen de Railway
+// --- SISTEMA DE COLA ANTI-BANEO ---
+const messageQueue = [];
+let isProcessingQueue = false;
+
+async function processQueue() {
+    // Si ya estamos procesando o la cola está vacía, no hacemos nada
+    if (isProcessingQueue || messageQueue.length === 0) return;
+    
+    isProcessingQueue = true;
+
+    while (messageQueue.length > 0) {
+        // Sacamos el primer mensaje de la fila
+        const { phone, message } = messageQueue.shift();
+        const chatId = `${phone}@c.us`;
+
+        try {
+            console.log(`[Cola] Procesando mensaje para ${phone}... Quedan ${messageQueue.length} en espera.`);
+
+            // 1. Simular que un humano está escribiendo (Opcional pero muy efectivo)
+            const chat = await client.getChatById(chatId);
+            await chat.sendStateTyping();
+
+            // 2. Tiempo aleatorio "escribiendo" (entre 2 y 4 segundos)
+            const typingDelay = Math.floor(Math.random() * 2000) + 2000;
+            await new Promise(r => setTimeout(r, typingDelay));
+
+            // 3. Enviar el mensaje real
+            await client.sendMessage(chatId, message);
+            console.log(`✅ Mensaje enviado con éxito a ${phone}`);
+
+            // 4. Pausa de "Respiro" Anti-Ban ANTES de procesar el siguiente mensaje
+            // Solo pausamos si quedan más mensajes en la fila
+            if (messageQueue.length > 0) {
+                // Pausa aleatoria entre 8 y 15 segundos
+                const sleepTime = Math.floor(Math.random() * 7000) + 8000;
+                console.log(`⏳ Anti-Ban: Esperando ${sleepTime / 1000}s para el próximo envío...`);
+                await new Promise(r => setTimeout(r, sleepTime));
+            }
+
+        } catch (error) {
+            console.error(`❌ Error enviando a ${phone}:`, error.message);
+        }
+    }
+
+    isProcessingQueue = false;
+    console.log('🏁 Todos los mensajes en la cola han sido enviados.');
+}
+// ----------------------------------
+
 const client = new Client({
-    authStrategy: new LocalAuth({
-        dataPath: '/app/whatsapp_session' // <--- Ruta de tu disco duro virtual
-    }),
-    webVersionCache: {
-        type: 'remote',
-        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
-    },
+    authStrategy: new LocalAuth({ dataPath: '/app/whatsapp_session' }),
     puppeteer: {
         handleSIGINT: false,
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--single-process',
-            '--no-zygote'
-        ],
+        args: ['--no-sandbox', '--disable-setuid-sandbox', '--single-process'],
         executablePath: '/usr/bin/google-chrome-stable'
     }
 });
@@ -33,68 +69,40 @@ const client = new Client({
 client.on('qr', async (qr) => {
     isReady = false;
     latestQr = await QRCode.toDataURL(qr);
-    console.log('✨ Nuevo QR generado. Listo para escanear en /qr');
 });
 
 client.on('ready', () => {
     isReady = true;
     latestQr = null;
-    console.log('✅ ¡WhatsApp Conectado y sesión guardada en el disco!');
+    console.log('✅ ¡WhatsApp Conectado y listo para encolar!');
+    
+    // Si el servidor se reinició y había mensajes guardados (opcional avanzado),
+    // aquí podrías retomar, pero por ahora en memoria es suficiente.
 });
 
-client.on('authenticated', () => {
-    console.log('🔓 Autenticación exitosa');
-});
-
-client.on('auth_failure', (msg) => {
-    console.error('❌ Error de Autenticación:', msg);
-});
-
-// --- RUTAS ---
-app.get('/qr', (req, res) => {
-    if (isReady) {
-        return res.send(`
-            <div style="text-align:center; font-family:sans-serif; margin-top:100px;">
-                <h1 style="color:#128c7e;">✅ WhatsApp Conectado</h1>
-                <p>Tu sistema de CrumbCore ya está operativo.</p>
-            </div>
-        `);
-    }
-
-    if (latestQr) {
-        res.send(`
-            <html>
-                <head>
-                    <meta http-equiv="refresh" content="15">
-                    <style>
-                        body { display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; font-family:sans-serif; background:#f0f2f5; }
-                        .card { background:white; padding:40px; border-radius:20px; box-shadow:0 10px 25px rgba(0,0,0,0.1); text-align:center; }
-                        img { width:300px; margin:20px 0; border: 5px solid #fff; outline: 1px solid #ddd; }
-                    </style>
-                </head>
-                <body>
-                    <div class="card">
-                        <h2 style="color:#128c7e;">Vincular WhatsApp</h2>
-                        <img src="${latestQr}">
-                        <p>La página se refresca sola cada 15s</p>
-                    </div>
-                </body>
-            </html>
-        `);
-    } else {
-        res.send('<h2 style="text-align:center; margin-top:50px;">Cargando... recarga en 5 segs.</h2>');
-    }
-});
-
-app.post('/send', async (req, res) => {
+// Endpoint MODIFICADO para usar la cola
+app.post('/send', (req, res) => {
     if (!isReady) return res.status(503).json({ error: 'WhatsApp Offline' });
-    try {
-        await client.sendMessage(`${req.body.phone}@c.us`, req.body.message);
-        res.json({ status: 'sent' });
-    } catch (e) {
-        res.status(500).json({ error: e.message });
+
+    const { phone, message } = req.body;
+    
+    if (!phone || !message) {
+        return res.status(400).json({ error: 'Faltan datos' });
     }
+
+    // 1. Añadimos a la fila
+    messageQueue.push({ phone, message });
+
+    // 2. Avisamos al procesador que revise la fila
+    processQueue();
+
+    // 3. Le respondemos a Django INMEDIATAMENTE. 
+    // Django no tiene que esperar 15 segundos a que el mensaje se envíe.
+    res.status(200).json({ 
+        status: 'queued', 
+        detail: `Mensaje encolado. Posición: ${messageQueue.length}` 
+    });
 });
 
 client.initialize();
-app.listen(process.env.PORT || 3000, () => console.log('🚀 Microservicio QR iniciado'));
+app.listen(process.env.PORT || 3000, () => console.log('🚀 Microservicio iniciado'));
