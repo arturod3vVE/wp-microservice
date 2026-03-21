@@ -8,42 +8,63 @@ app.use(express.json());
 let isReady = false;
 let latestQr = null;
 
+// --- CONFIGURACIÓN BLINDADA PARA RAILWAY ---
+const client = new Client({
+    authStrategy: new LocalAuth({ 
+        dataPath: '/app/whatsapp_session' // Tu disco duro virtual
+    }),
+    webVersionCache: {
+        type: 'remote',
+        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
+    },
+    puppeteer: {
+        handleSIGINT: false,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage', // CRÍTICO: Evita que Chrome explote por memoria
+            '--single-process',
+            '--no-zygote',
+            '--disable-web-security',
+            '--disable-features=IsolateOrigins,site-per-process',
+            '--disable-site-isolation-trials',
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36'
+        ],
+        executablePath: '/usr/bin/google-chrome-stable'
+    }
+});
+
 // --- SISTEMA DE COLA ANTI-BANEO ---
 const messageQueue = [];
 let isProcessingQueue = false;
 
 async function processQueue() {
-    // Si ya estamos procesando o la cola está vacía, no hacemos nada
     if (isProcessingQueue || messageQueue.length === 0) return;
-    
     isProcessingQueue = true;
 
     while (messageQueue.length > 0) {
-        // Sacamos el primer mensaje de la fila
         const { phone, message } = messageQueue.shift();
         const chatId = `${phone}@c.us`;
 
         try {
-            console.log(`[Cola] Procesando mensaje para ${phone}... Quedan ${messageQueue.length} en espera.`);
+            console.log(`[Cola] Procesando envío para ${phone}... (Faltan ${messageQueue.length})`);
 
-            // 1. Simular que un humano está escribiendo (Opcional pero muy efectivo)
+            // 1. Simular humano escribiendo
             const chat = await client.getChatById(chatId);
             await chat.sendStateTyping();
 
-            // 2. Tiempo aleatorio "escribiendo" (entre 2 y 4 segundos)
+            // 2. Retraso aleatorio (2 a 4 segundos)
             const typingDelay = Math.floor(Math.random() * 2000) + 2000;
             await new Promise(r => setTimeout(r, typingDelay));
 
-            // 3. Enviar el mensaje real
+            // 3. Enviar mensaje
             await client.sendMessage(chatId, message);
-            console.log(`✅ Mensaje enviado con éxito a ${phone}`);
+            console.log(`✅ Mensaje enviado a ${phone}`);
 
-            // 4. Pausa de "Respiro" Anti-Ban ANTES de procesar el siguiente mensaje
-            // Solo pausamos si quedan más mensajes en la fila
+            // 4. Pausa Anti-Ban si hay más mensajes en fila (8 a 15 segundos)
             if (messageQueue.length > 0) {
-                // Pausa aleatoria entre 8 y 15 segundos
                 const sleepTime = Math.floor(Math.random() * 7000) + 8000;
-                console.log(`⏳ Anti-Ban: Esperando ${sleepTime / 1000}s para el próximo envío...`);
+                console.log(`⏳ Anti-Ban: Pausa de ${sleepTime / 1000}s para no alertar a WhatsApp...`);
                 await new Promise(r => setTimeout(r, sleepTime));
             }
 
@@ -53,54 +74,64 @@ async function processQueue() {
     }
 
     isProcessingQueue = false;
-    console.log('🏁 Todos los mensajes en la cola han sido enviados.');
+    console.log('🏁 La cola de mensajes está vacía.');
 }
-// ----------------------------------
 
-const client = new Client({
-    authStrategy: new LocalAuth({ dataPath: '/app/whatsapp_session' }),
-    puppeteer: {
-        handleSIGINT: false,
-        args: ['--no-sandbox', '--disable-setuid-sandbox', '--single-process'],
-        executablePath: '/usr/bin/google-chrome-stable'
-    }
-});
-
+// --- EVENTOS DE WHATSAPP ---
 client.on('qr', async (qr) => {
     isReady = false;
     latestQr = await QRCode.toDataURL(qr);
+    console.log('✨ Nuevo QR generado. Entra a tu link terminado en /qr');
 });
 
 client.on('ready', () => {
     isReady = true;
     latestQr = null;
-    console.log('✅ ¡WhatsApp Conectado y listo para encolar!');
-    
-    // Si el servidor se reinició y había mensajes guardados (opcional avanzado),
-    // aquí podrías retomar, pero por ahora en memoria es suficiente.
+    console.log('✅ ¡WhatsApp Conectado y listo para trabajar!');
 });
 
-// Endpoint MODIFICADO para usar la cola
-app.post('/send', (req, res) => {
-    if (!isReady) return res.status(503).json({ error: 'WhatsApp Offline' });
+client.on('authenticated', () => console.log('🔓 Sesión Autenticada y guardada en el disco'));
+client.on('auth_failure', (msg) => console.error('❌ Error de Autenticación:', msg));
 
-    const { phone, message } = req.body;
-    
-    if (!phone || !message) {
-        return res.status(400).json({ error: 'Faltan datos' });
+// --- RUTAS WEB ---
+app.get('/qr', (req, res) => {
+    if (isReady) {
+        return res.send(`
+            <div style="text-align:center; font-family:sans-serif; margin-top:100px;">
+                <h1 style="color:#128c7e;">✅ Sistema Operativo</h1>
+                <p>CrumbCore está conectado a WhatsApp.</p>
+            </div>
+        `);
     }
 
-    // 1. Añadimos a la fila
-    messageQueue.push({ phone, message });
+    if (latestQr) {
+        res.send(`
+            <div style="text-align:center; font-family:sans-serif; margin-top:50px;">
+                <h2 style="color:#128c7e;">Vincular WhatsApp</h2>
+                <img src="${latestQr}" style="width:300px; border:5px solid white; box-shadow:0 0 10px rgba(0,0,0,0.1);">
+                <p>La página se refresca cada 15s automáticamente.</p>
+                <script>setTimeout(() => location.reload(), 15000);</script>
+            </div>
+        `);
+    } else {
+        res.send('<h3 style="text-align:center; margin-top:50px;">Cargando motor de WhatsApp... recarga en 5 segs.</h3>');
+    }
+});
 
-    // 2. Avisamos al procesador que revise la fila
+app.post('/send', (req, res) => {
+    if (!isReady) return res.status(503).json({ error: 'WhatsApp Offline' });
+    
+    const { phone, message } = req.body;
+    if (!phone || !message) return res.status(400).json({ error: 'Faltan datos' });
+
+    // Enviar a la cola
+    messageQueue.push({ phone, message });
     processQueue();
 
-    // 3. Le respondemos a Django INMEDIATAMENTE. 
-    // Django no tiene que esperar 15 segundos a que el mensaje se envíe.
+    // Responder rápido a Django
     res.status(200).json({ 
         status: 'queued', 
-        detail: `Mensaje encolado. Posición: ${messageQueue.length}` 
+        detail: `Mensaje recibido. Posición en cola: ${messageQueue.length}` 
     });
 });
 
