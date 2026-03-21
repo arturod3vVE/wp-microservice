@@ -1,59 +1,78 @@
-const { Client, LocalAuth } = require('whatsapp-web.js');
+const { Client, RemoteAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const express = require('express');
 
+// Nuevas importaciones para la Base de Datos
+const { PostgresStore } = require('wwebjs-postgres');
+const { Client: PgClient } = require('pg');
+
 const app = express();
-app.use(express.json()); // Para poder recibir datos en formato JSON desde Django
+app.use(express.json());
 
-// Inicializamos el cliente. LocalAuth guarda la sesión para no escanear el QR cada vez que reinicies
-const client = new Client({
-    authStrategy: new LocalAuth()
+// 1. Configuramos la conexión a tu PostgreSQL (Render te dará la URL)
+const pgClient = new PgClient({
+    connectionString: process.env.DATABASE_URL, 
+    ssl: { rejectUnauthorized: false } // Obligatorio para bases de datos en la nube
 });
 
-// Evento 1: Generar el código QR en la terminal
-client.on('qr', (qr) => {
-    console.log('\n=========================================');
-    console.log('📱 ESCANEA ESTE QR CON TU WHATSAPP');
-    console.log('=========================================\n');
-    qrcode.generate(qr, { small: true });
-});
+// 2. Conectamos a la BD antes de encender WhatsApp
+pgClient.connect().then(() => {
+    console.log('✅ Conectado a la base de datos PostgreSQL');
+    
+    // Creamos el "almacén" de sesión apuntando a tu BD
+    const store = new PostgresStore({ client: pgClient });
 
-// Evento 2: Confirmación de conexión exitosa
-client.on('ready', () => {
-    console.log('✅ ¡WhatsApp está conectado y listo para enviar mensajes!');
-});
+    // 3. Inicializamos WhatsApp con RemoteAuth
+    const client = new Client({
+        authStrategy: new RemoteAuth({
+            store: store,
+            backupSyncIntervalMs: 300000
+        }),
+        puppeteer: {
+            args: ['--no-sandbox', '--disable-setuid-sandbox']
+        }
+    });
 
-// Evento 3: Manejo de desconexiones
-client.on('disconnected', (reason) => {
-    console.log('❌ WhatsApp se desconectó:', reason);
-});
+    client.on('qr', (qr) => {
+        console.log('\n📱 ESCANEA ESTE QR CON TU WHATSAPP');
+        qrcode.generate(qr, { small: true });
+    });
 
-// CREAMOS EL ENDPOINT PARA DJANGO
-app.post('/send', async (req, res) => {
-    const { phone, message } = req.body;
+    client.on('ready', () => {
+        console.log('✅ ¡WhatsApp está conectado y listo para enviar mensajes!');
+    });
 
-    if (!phone || !message) {
-        return res.status(400).send({ error: 'Faltan datos (phone o message)' });
-    }
+    // Nuevo evento: Te avisa cuando la sesión se guardó en tu base de datos
+    client.on('remote_session_saved', () => {
+        console.log('💾 Sesión guardada de forma segura en PostgreSQL');
+    });
 
-    // WhatsApp requiere que el número termine en @c.us
-    const chatId = `${phone}@c.us`;
+    client.on('disconnected', (reason) => {
+        console.log('❌ WhatsApp se desconectó:', reason);
+    });
 
-    try {
-        await client.sendMessage(chatId, message);
-        console.log(`Mensaje enviado a ${phone}`);
-        res.status(200).send({ status: 'enviado' });
-    } catch (error) {
-        console.error(`Error enviando a ${phone}:`, error);
-        res.status(500).send({ error: 'Fallo al enviar el mensaje' });
-    }
-});
+    app.post('/send', async (req, res) => {
+        const { phone, message } = req.body;
+        if (!phone || !message) {
+            return res.status(400).send({ error: 'Faltan datos (phone o message)' });
+        }
 
-// Arrancamos el cliente de WhatsApp
-client.initialize();
+        const chatId = `${phone}@c.us`;
 
-// Arrancamos el servidor API en el puerto 3000
-const PORT = 3000;
-app.listen(PORT, () => {
-    console.log(`🚀 Microservicio API corriendo en http://localhost:${PORT}`);
+        try {
+            await client.sendMessage(chatId, message);
+            console.log(`Mensaje enviado a ${phone}`);
+            res.status(200).send({ status: 'enviado' });
+        } catch (error) {
+            console.error(`Error enviando a ${phone}:`, error);
+            res.status(500).send({ error: 'Fallo al enviar el mensaje' });
+        }
+    });
+
+    client.initialize();
+
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+        console.log(`🚀 Microservicio API corriendo en el puerto ${PORT}`);
+    });
 });
