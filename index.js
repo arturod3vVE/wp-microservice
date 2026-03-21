@@ -6,7 +6,6 @@ const { Client: PgClient } = require('pg');
 const app = express();
 app.use(express.json());
 
-let pairingCode = null; // Aquí guardaremos el código de 8 dígitos
 let isReady = false;
 
 const dbConfig = {
@@ -18,14 +17,14 @@ const pgClient = new PgClient(dbConfig);
 
 pgClient.connect().then(() => {
     console.log('✅ Base de datos conectada');
-    const store = new PostgresStore({ connectionConfig: dbConfig });
+    const store = new PostgresStore({ client: pgClient });
 
     const client = new Client({
         authStrategy: new RemoteAuth({
             store: store,
             backupSyncIntervalMs: 300000
         }),
-        // ESTO ES LO QUE SOLUCIONA EL ERROR:
+        // Forzamos una versión de WA Web que sabemos que funciona con códigos
         webVersionCache: {
             type: 'remote',
             remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
@@ -33,82 +32,66 @@ pgClient.connect().then(() => {
         puppeteer: {
             handleSIGINT: false,
             args: [
-                '--no-sandbox', 
-                '--disable-setuid-sandbox', 
-                '--disable-dev-shm-usage', 
-                '--single-process'
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--single-process',
+                // USER AGENT: Engañamos a WhatsApp para que crea que somos un Chrome real en Windows
+                '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
             ],
             executablePath: '/usr/bin/google-chrome-stable'
         }
     });
 
-    // 1. EVENTO QR: Si no quieres usar código, el QR sigue ahí en la consola
-    client.on('qr', (qr) => {
-        isReady = false;
-        console.log('--- NUEVO QR DISPONIBLE ---');
-    });
-
     client.on('ready', () => {
         isReady = true;
-        pairingCode = null;
-        console.log('✅ ¡WhatsApp Vinculado y Listo!');
+        console.log('✅ ¡WhatsApp Conectado!');
     });
 
-    // --- RUTA PARA PEDIR EL CÓDIGO DE TELÉFONO ---
-    // Uso: https://tu-app.onrender.com/vincular?phone=584121234567
+    // RUTA DE VINCULACIÓN MEJORADA
     app.get('/vincular', async (req, res) => {
         const phone = req.query.phone;
-        
-        if (!phone) {
-            return res.send('Error: Debes poner tu número así: /vincular?phone=58412XXXXXXX');
-        }
+        if (!phone) return res.send('Falta el número: /vincular?phone=58412XXXXXXX');
+        if (isReady) return res.send('✅ Ya estás conectado.');
 
-        if (isReady) return res.send('✅ Ya estás vinculado.');
+        console.log(`⏳ Generando código para ${phone}...`);
 
         try {
-            // Esta es la magia: pedimos el código de 8 dígitos al servidor de WhatsApp
-            pairingCode = await client.requestPairingCode(phone);
+            // TRUCO: Esperamos 5 segundos antes de pedir el código para que la página "respire"
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            
+            const code = await client.requestPairingCode(phone);
             
             res.send(`
                 <div style="text-align:center; font-family:sans-serif; margin-top:50px;">
                     <h1 style="color:#128c7e;">Código de Vinculación</h1>
-                    <p>Introduce este código en tu teléfono:</p>
                     <div style="font-size:3rem; font-weight:bold; letter-spacing:5px; background:#e1f5fe; padding:20px; display:inline-block; border-radius:10px; border:2px solid #01579b;">
-                        ${pairingCode}
+                        ${code}
                     </div>
-                    <div style="margin-top:30px; text-align:left; display:inline-block; max-width:400px;">
-                        <p><strong>Pasos en tu celular:</strong></p>
-                        <ol>
-                            <li>Abre WhatsApp.</li>
-                            <li>Ajustes / Configuración.</li>
-                            <li>Dispositivos vinculados.</li>
-                            <li>Vincular un dispositivo.</li>
-                            <li>Toca en <b>"Vincular con el número de teléfono"</b> (abajo).</li>
-                            <li>Escribe el código de arriba.</li>
-                        </ol>
-                    </div>
+                    <p style="margin-top:20px;">Introdúcelo en tu WhatsApp (Dispositivos vinculados > Vincular con número)</p>
                 </div>
             `);
         } catch (err) {
-            res.send('Error al generar código: ' + err.message);
+            console.error('Error detallado:', err);
+            res.send(`
+                <div style="text-align:center; font-family:sans-serif; margin-top:50px;">
+                    <h2 style="color:red;">Error de sincronización</h2>
+                    <p>WhatsApp rechazó la petición (Error: ${err.message}).</p>
+                    <p><b>Causa probable:</b> El servidor gratuito de Render es lento para cargar la interfaz.</p>
+                    <button onclick="location.reload()">Reintentar ahora</button>
+                </div>
+            `);
         }
-    });
-
-    app.get('/status', (req, res) => {
-        res.json({ connected: isReady });
     });
 
     app.post('/send', async (req, res) => {
-        if (!isReady) return res.status(503).json({ error: 'WhatsApp Offline' });
-        const { phone, message } = req.body;
+        if (!isReady) return res.status(503).json({ error: 'Offline' });
         try {
-            await client.sendMessage(`${phone}@c.us`, message);
+            await client.sendMessage(`${req.body.phone}@c.us`, req.body.message);
             res.json({ status: 'ok' });
-        } catch (e) {
-            res.status(500).json({ error: e.message });
-        }
+        } catch (e) { res.status(500).json({ error: e.message }); }
     });
 
     client.initialize();
-    app.listen(process.env.PORT || 3000, () => console.log('🚀 API Online'));
+    app.listen(process.env.PORT || 3000);
 });
