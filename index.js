@@ -19,17 +19,35 @@ const pgClient = new PgClient({
 pgClient.connect().then(() => {
     console.log('✅ Conectado a la base de datos PostgreSQL');
     
-    // Creamos el "almacén" de sesión apuntando a tu BD
-    const store = new PostgresStore({ client: pgClient });
+    const app = express();
+    app.use(express.json());
 
-    // 3. Inicializamos WhatsApp con RemoteAuth
+    const dbConfig = {
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false }
+    };
+
+    // 2. Inicializamos el Store pasándole la configuración directamente
+    const store = new PostgresStore({ 
+        connectionConfig: dbConfig 
+    });
+
+    // 3. Ahora sí, procedemos con la lógica de WhatsApp
+    console.log('⏳ Inicializando almacén de sesiones en PostgreSQL...');
+
     const client = new Client({
         authStrategy: new RemoteAuth({
             store: store,
             backupSyncIntervalMs: 300000
         }),
         puppeteer: {
-            args: ['--no-sandbox', '--disable-setuid-sandbox']
+            handleSIGINT: false, // Recomendado para entornos Docker/Render
+            args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage', // Ayuda con la memoria en Render Free
+            ],
+            executablePath: '/usr/bin/google-chrome-stable' // Forzamos la ruta del Chrome que instalamos en el Dockerfile
         }
     });
 
