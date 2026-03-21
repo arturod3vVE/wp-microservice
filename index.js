@@ -13,16 +13,13 @@ const client = new Client({
     authStrategy: new LocalAuth({ 
         dataPath: '/app/whatsapp_session' // Tu disco duro virtual
     }),
-    webVersionCache: {
-        type: 'remote',
-        remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
-    },
+    // ⚠️ ELIMINAMOS EL webVersionCache AQUÍ PARA EVITAR EL "DETACHED FRAME"
     puppeteer: {
         handleSIGINT: false,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage', // CRÍTICO: Evita que Chrome explote por memoria
+            '--disable-dev-shm-usage', 
             '--single-process',
             '--no-zygote',
             '--disable-web-security',
