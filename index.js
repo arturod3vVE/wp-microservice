@@ -8,20 +8,20 @@ app.use(express.json());
 let isReady = false;
 let latestQr = null;
 
-// --- CONFIGURACIÓN BLINDADA PARA RAILWAY ---
 const client = new Client({
     authStrategy: new LocalAuth({ 
-        dataPath: '/app/whatsapp_session' // Tu disco duro virtual
+        dataPath: '/app/whatsapp_session' 
     }),
-    // ⚠️ ELIMINAMOS EL webVersionCache AQUÍ PARA EVITAR EL "DETACHED FRAME"
     puppeteer: {
         handleSIGINT: false,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage', 
-            '--single-process',
-            '--no-zygote',
+            '--disable-dev-shm-usage', // CRÍTICO para Docker/Railway
+            '--disable-gpu',           // WhatsApp no necesita tarjeta gráfica
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            // ⚠️ ELIMINAMOS --single-process QUE ESTABA CAUSANDO EL CRASH
             '--disable-web-security',
             '--disable-features=IsolateOrigins,site-per-process',
             '--disable-site-isolation-trials',
