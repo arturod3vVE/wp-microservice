@@ -8,7 +8,6 @@ app.use(express.json());
 
 let isReady = false;
 
-// 1. Configuración de la base de datos
 const dbConfig = {
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false }
@@ -16,15 +15,16 @@ const dbConfig = {
 
 const pgClient = new PgClient(dbConfig);
 
-// Conectamos a Postgres
 pgClient.connect().then(() => {
-    const store = new PostgresStore({ connectionConfig: dbConfig });
+    console.log('✅ Base de datos conectada');
+    const store = new PostgresStore({ client: pgClient });
 
     const client = new Client({
         authStrategy: new RemoteAuth({
             store: store,
             backupSyncIntervalMs: 300000
         }),
+        // Forzamos una versión específica que es famosa por ser estable con códigos
         webVersionCache: {
             type: 'remote',
             remotePath: 'https://raw.githubusercontent.com/wppconnect-team/wa-version/main/html/2.2412.54.html',
@@ -36,27 +36,37 @@ pgClient.connect().then(() => {
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--single-process',
+                '--no-zygote',
                 '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
             ],
             executablePath: '/usr/bin/google-chrome-stable'
         }
     });
 
-    client.on('ready', () => { isReady = true; console.log('✅ Conectado'); });
+    client.on('ready', () => {
+        isReady = true;
+        console.log('✅ ¡WhatsApp Conectado!');
+    });
 
     app.get('/vincular', async (req, res) => {
         const phone = req.query.phone;
         if (!phone) return res.send('Falta el número.');
         if (isReady) return res.send('✅ Ya estás conectado.');
 
-        console.log(`⏳ Iniciando protocolo de vinculación para ${phone}...`);
+        console.log(`⏳ Iniciando vinculación para ${phone}...`);
 
         try {
-            // 1. ESPERA CRÍTICA: Render Free necesita tiempo. 
-            // Subimos a 15 segundos para asegurar que el JS de WhatsApp cargue.
-            await new Promise(resolve => setTimeout(resolve, 15000));
+            // 1. ESPERA ACTIVA: Esperamos a que el selector del QR o el botón de vincular existan
+            const page = client.pupPage;
+            if (page) {
+                console.log('📡 Esperando que WhatsApp Web cargue el DOM...');
+                await page.waitForSelector('canvas', { timeout: 60000 }).catch(() => console.log('Timeout canvas, procediendo...'));
+            }
+
+            // 2. PEQUEÑO DELAY EXTRA: Para que los scripts internos se asienten
+            await new Promise(resolve => setTimeout(resolve, 5000));
             
-            console.log('📡 Solicitando código a WhatsApp...');
+            console.log('📲 Solicitando código...');
             const code = await client.requestPairingCode(phone);
             
             res.send(`
@@ -65,20 +75,17 @@ pgClient.connect().then(() => {
                     <div style="font-size:3.5rem; font-weight:bold; background:#e1f5fe; padding:20px; display:inline-block; border-radius:10px; border:3px solid #01579b; font-family:monospace;">
                         ${code}
                     </div>
-                    <p style="margin-top:20px;">Ponlo en tu WhatsApp ahora mismo.</p>
+                    <p style="margin-top:20px;">Introduce este código en tu WhatsApp ahora.</p>
                 </div>
             `);
         } catch (err) {
             console.error('Error capturado:', err.message);
-            
-            // Si da el error "t", es que el navegador se quedó pegado.
-            // Forzamos un refresco interno para el próximo intento.
             res.send(`
                 <div style="text-align:center; font-family:sans-serif; margin-top:50px;">
-                    <h2 style="color:orange;">⏳ El servidor está "calentando"...</h2>
-                    <p>WhatsApp tardó demasiado en responder (Error t).</p>
-                    <p><b>No te rindas:</b> Haz clic en el botón de abajo. En el segundo o tercer intento siempre funciona porque la página ya queda cargada en memoria.</p>
-                    <button onclick="location.reload()" style="padding:15px 30px; font-size:1.2rem; cursor:pointer; background:#128c7e; color:white; border:none; border-radius:5px;">
+                    <h2 style="color:orange;">☕ El servidor está procesando...</h2>
+                    <p>WhatsApp devolvió un error temporal (${err.message}).</p>
+                    <p><b>Qué hacer:</b> Espera 10 segundos y presiona el botón "Reintentar".</p>
+                    <button onclick="location.reload()" style="padding:15px 30px; background:#128c7e; color:white; border:none; border-radius:5px; cursor:pointer; font-size:1.1rem;">
                         🔄 REINTENTAR VINCULACIÓN
                     </button>
                 </div>
