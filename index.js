@@ -1,39 +1,20 @@
 const { Client, RemoteAuth } = require('whatsapp-web.js');
-const qrcode = require('qrcode-terminal');
+const qrcodeTerminal = require('qrcode-terminal'); // El de la consola
+const QRCode = require('qrcode'); // El nuevo para generar imágenes
 const express = require('express');
-
-// Nuevas importaciones para la Base de Datos
 const { PostgresStore } = require('wwebjs-postgres');
 const { Client: PgClient } = require('pg');
 
 const app = express();
 app.use(express.json());
 
-// 1. Configuramos la conexión a tu PostgreSQL (Render te dará la URL)
-const pgClient = new PgClient({
-    connectionString: process.env.DATABASE_URL, 
-    ssl: { rejectUnauthorized: false } // Obligatorio para bases de datos en la nube
-});
+// Variable global para guardar la imagen del QR
+let latestQrImage = null;
 
-// 2. Conectamos a la BD antes de encender WhatsApp
+// ... (toda tu configuración de dbConfig y pgClient queda igual) ...
+
 pgClient.connect().then(() => {
-    console.log('✅ Conectado a la base de datos PostgreSQL');
-    
-    const app = express();
-    app.use(express.json());
-
-    const dbConfig = {
-        connectionString: process.env.DATABASE_URL,
-        ssl: { rejectUnauthorized: false }
-    };
-
-    // 2. Inicializamos el Store pasándole la configuración directamente
-    const store = new PostgresStore({ 
-        connectionConfig: dbConfig 
-    });
-
-    // 3. Ahora sí, procedemos con la lógica de WhatsApp
-    console.log('⏳ Inicializando almacén de sesiones en PostgreSQL...');
+    const store = new PostgresStore({ client: pgClient });
 
     const client = new Client({
         authStrategy: new RemoteAuth({
@@ -41,56 +22,65 @@ pgClient.connect().then(() => {
             backupSyncIntervalMs: 300000
         }),
         puppeteer: {
-            handleSIGINT: false, // Recomendado para entornos Docker/Render
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage', // Ayuda con la memoria en Render Free
-            ],
-            executablePath: '/usr/bin/google-chrome-stable' // Forzamos la ruta del Chrome que instalamos en el Dockerfile
+            args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+            executablePath: '/usr/bin/google-chrome-stable'
         }
     });
 
-    client.on('qr', (qr) => {
-        console.log('\n📱 ESCANEA ESTE QR CON TU WHATSAPP');
-        qrcode.generate(qr, { small: true });
+    // EVENTO QR ACTUALIZADO
+    client.on('qr', async (qr) => {
+        // 1. Lo seguimos mostrando en consola por si acaso
+        qrcodeTerminal.generate(qr, { small: true });
+        
+        // 2. Lo convertimos a una imagen Base64 para la web
+        try {
+            latestQrImage = await QRCode.toDataURL(qr);
+            console.log('✅ Imagen QR generada. Disponible en /qr');
+        } catch (err) {
+            console.error('Error generando QR imagen:', err);
+        }
     });
 
     client.on('ready', () => {
-        console.log('✅ ¡WhatsApp está conectado y listo para enviar mensajes!');
+        latestQrImage = null; // Limpiamos el QR cuando ya se conectó
+        console.log('✅ ¡WhatsApp Conectado!');
     });
 
-    // Nuevo evento: Te avisa cuando la sesión se guardó en tu base de datos
-    client.on('remote_session_saved', () => {
-        console.log('💾 Sesión guardada de forma segura en PostgreSQL');
-    });
-
-    client.on('disconnected', (reason) => {
-        console.log('❌ WhatsApp se desconectó:', reason);
-    });
-
-    app.post('/send', async (req, res) => {
-        const { phone, message } = req.body;
-        if (!phone || !message) {
-            return res.status(400).send({ error: 'Faltan datos (phone o message)' });
+    // --- NUEVA RUTA PARA VER EL QR EN EL NAVEGADOR ---
+    app.get('/qr', (req, res) => {
+        if (latestQrImage) {
+            res.send(`
+                <html>
+                    <body style="display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; font-family:sans-serif; background:#f0f2f5;">
+                        <div style="background:white; padding:40px; border-radius:20px; box-shadow: 0 10px 25px rgba(0,0,0,0.1); text-align:center;">
+                            <h1 style="color:#128c7e;">Vincular CrumbCore</h1>
+                            <p>Abre WhatsApp > Dispositivos vinculados > Vincular dispositivo</p>
+                            <img src="${latestQrImage}" style="width:300px; margin:20px 0; border: 1px solid #ddd;">
+                            <p style="color:#666; font-size:0.8rem;">La página se actualiza automáticamente</p>
+                        </div>
+                        <script>setTimeout(() => location.reload(), 30000);</script>
+                    </body>
+                </html>
+            `);
+        } else {
+            res.send(`
+                <html>
+                    <body style="display:flex; align-items:center; justify-content:center; height:100vh; font-family:sans-serif; background:#f0f2f5;">
+                        <div style="text-align:center;">
+                            <h1>✅ WhatsApp ya está vinculado</h1>
+                            <p>No es necesario escanear nada. El servicio está activo.</p>
+                            <a href="/" style="color:#128c7e;">Volver al inicio</a>
+                        </div>
+                    </body>
+                </html>
+            `);
         }
-
-        const chatId = `${phone}@c.us`;
-
-        try {
-            await client.sendMessage(chatId, message);
-            console.log(`Mensaje enviado a ${phone}`);
-            res.status(200).send({ status: 'enviado' });
-        } catch (error) {
-            console.error(`Error enviando a ${phone}:`, error);
-            res.status(500).send({ error: 'Fallo al enviar el mensaje' });
-        }
     });
 
+    // ... (tu app.post('/send') y el resto queda igual) ...
+    
     client.initialize();
-
+    
     const PORT = process.env.PORT || 3000;
-    app.listen(PORT, () => {
-        console.log(`🚀 Microservicio API corriendo en el puerto ${PORT}`);
-    });
+    app.listen(PORT, () => console.log(`🚀 API en puerto ${PORT}`));
 });
