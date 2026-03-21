@@ -34,6 +34,7 @@ const client = new Client({
 // --- SISTEMA DE COLA ANTI-BANEO ---
 const messageQueue = [];
 let isProcessingQueue = false;
+let messagesSentInCurrentBatch = 0; // Contador para los descansos largos
 
 async function processQueue() {
     if (isProcessingQueue || messageQueue.length === 0) return;
@@ -44,24 +45,36 @@ async function processQueue() {
         const chatId = `${phone}@c.us`;
 
         try {
-            console.log(`[Cola] Procesando envío para ${phone}... (Faltan ${messageQueue.length})`);
+            console.log(`[Cola] 📦 Procesando envío para ${phone}... (Faltan ${messageQueue.length})`);
 
-            // 1. Simular humano escribiendo
             const chat = await client.getChatById(chatId);
+            
             await chat.sendStateTyping();
-
-            // 2. Retraso aleatorio (2 a 4 segundos)
-            const typingDelay = Math.floor(Math.random() * 2000) + 2000;
+            let typingDelay = (message.length / 4) * 1000; 
+            
+            typingDelay = Math.max(3000, Math.min(typingDelay, 12000)); 
+            
+            typingDelay += (Math.random() * 2000);
+            
+            console.log(`✍️ Simulando escritura por ${(typingDelay/1000).toFixed(1)}s...`);
             await new Promise(r => setTimeout(r, typingDelay));
+            await chat.clearState(); // Dejamos de escribir
 
-            // 3. Enviar mensaje
+            // 2. Enviar el mensaje real
             await client.sendMessage(chatId, message);
-            console.log(`✅ Mensaje enviado a ${phone}`);
+            console.log(`✅ Mensaje entregado a ${phone}`);
+            
+            messagesSentInCurrentBatch++;
 
-            // 4. Pausa Anti-Ban si hay más mensajes en fila (8 a 15 segundos)
-            if (messageQueue.length > 0) {
-                const sleepTime = Math.floor(Math.random() * 7000) + 8000;
-                console.log(`⏳ Anti-Ban: Pausa de ${sleepTime / 1000}s para no alertar a WhatsApp...`);
+            if (messagesSentInCurrentBatch >= 10 && messageQueue.length > 0) {
+                const coffeeBreak = Math.floor(Math.random() * 120000) + 120000; // 2 a 4 min
+                console.log(`☕ [ANTI-BAN] Descanso largo activado. Pausando por ${(coffeeBreak/60000).toFixed(1)} minutos...`);
+                await new Promise(r => setTimeout(r, coffeeBreak));
+                messagesSentInCurrentBatch = 0; 
+            } 
+            else if (messageQueue.length > 0) {
+                const sleepTime = Math.floor(Math.random() * 25000) + 15000;
+                console.log(`⏳ [ANTI-BAN] Respirando por ${(sleepTime / 1000).toFixed(1)}s antes del próximo chat...`);
                 await new Promise(r => setTimeout(r, sleepTime));
             }
 
@@ -71,7 +84,8 @@ async function processQueue() {
     }
 
     isProcessingQueue = false;
-    console.log('🏁 La cola de mensajes está vacía.');
+    messagesSentInCurrentBatch = 0; 
+    console.log('🏁 La cola de mensajes está limpia y vacía.');
 }
 
 // --- EVENTOS DE WHATSAPP ---
