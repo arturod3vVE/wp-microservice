@@ -2,81 +2,27 @@ const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLat
 const express = require('express');
 const QRCode = require('qrcode');
 const pino = require('pino');
+const fs = require('fs');
+const path = require('path');
 
 const app = express();
 app.use(express.json());
 
-let sock;
-let isReady = false;
-let latestQr = null;
+// 🗂️ DICCIONARIO DE SESIONES ACTIVAS
+// Aquí guardaremos { sock, qr, status } para cada store_id
+const sessions = new Map(); 
 
-// --- 🛡️ SISTEMA DE COLA ANTI-BANEO 🛡️ ---
-const messageQueue = [];
-let isProcessingQueue = false;
-let messagesSentInCurrentBatch = 0;
+// Ruta base del volumen de Railway
+const AUTH_DIR = '/app/baileys_auth_info';
+if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
 
-async function processQueue() {
-    if (isProcessingQueue || messageQueue.length === 0) return;
-    isProcessingQueue = true;
+// --- ⚙️ MOTOR CREADOR DE SESIONES ---
+async function initSession(storeId) {
+    const sessionPath = path.join(AUTH_DIR, `store_${storeId}`);
+    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+    const { version } = await fetchLatestBaileysVersion();
 
-    while (messageQueue.length > 0) {
-        const { phone, message, storeNameSafe } = messageQueue.shift();
-        const jid = `${phone}@s.whatsapp.net`; // Formato estricto de Baileys
-
-        try {
-            console.log(`[Cola] 📦 Procesando envío para ${phone}... (Faltan ${messageQueue.length})`);
-
-            // 1. Simular "Escribiendo..."
-            await sock.sendPresenceUpdate('composing', jid);
-            
-            let typingDelay = (message.length / 4) * 1000; 
-            typingDelay = Math.max(3000, Math.min(typingDelay, 12000)); 
-            typingDelay += (Math.random() * 2000);
-            
-            console.log(`✍️ Simulando escritura por ${(typingDelay/1000).toFixed(1)}s...`);
-            await new Promise(r => setTimeout(r, typingDelay));
-            
-            // 2. Dejar de escribir
-            await sock.sendPresenceUpdate('paused', jid);
-
-            // 3. Enviar el mensaje real
-            const finalMessage = `👋 ¡Hola!\n🧁 *${storeNameSafe}* te informa:\n\n${message}`;
-            await sock.sendMessage(jid, { text: finalMessage });
-            console.log(`✅ Mensaje entregado a ${phone}`);
-            
-            messagesSentInCurrentBatch++;
-
-            // 4. Descansos Inteligentes
-            if (messagesSentInCurrentBatch >= 10 && messageQueue.length > 0) {
-                const coffeeBreak = Math.floor(Math.random() * 120000) + 120000;
-                console.log(`☕ [ANTI-BAN] Descanso largo activado. Pausando por ${(coffeeBreak/60000).toFixed(1)} minutos...`);
-                await new Promise(r => setTimeout(r, coffeeBreak));
-                messagesSentInCurrentBatch = 0; 
-            } 
-            else if (messageQueue.length > 0) {
-                const sleepTime = Math.floor(Math.random() * 25000) + 15000;
-                console.log(`⏳ [ANTI-BAN] Respirando por ${(sleepTime / 1000).toFixed(1)}s antes del próximo chat...`);
-                await new Promise(r => setTimeout(r, sleepTime));
-            }
-
-        } catch (error) {
-            console.error(`❌ Error enviando a ${phone}:`, error.message || error);
-        }
-    }
-
-    isProcessingQueue = false;
-    messagesSentInCurrentBatch = 0; 
-    console.log('🏁 La cola de mensajes está limpia y vacía.');
-}
-
-// --- ⚙️ SISTEMA CENTRAL DE BAILEYS ---
-async function connectToWhatsApp() {
-    const { state, saveCreds } = await useMultiFileAuthState('baileys_auth_info');
-    
-    const { version, isLatest } = await fetchLatestBaileysVersion();
-    console.log(`[Sistema] Usando WA v${version.join('.')} (Última: ${isLatest})`);
-
-    sock = makeWASocket({
+    const sock = makeWASocket({
         version,
         auth: state,
         printQRInTerminal: false,
@@ -84,64 +30,112 @@ async function connectToWhatsApp() {
         browser: Browsers.macOS('Desktop')
     });
 
+    // Guardamos la sesión en el mapa con estado inicial
+    sessions.set(storeId, { sock, status: 'STARTING', qr: null });
+
     sock.ev.on('creds.update', saveCreds);
 
     sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
+        const currentSession = sessions.get(storeId);
 
         if (qr) {
-            console.log('✨ Nuevo QR generado. Entra a tu endpoint /qr');
-            latestQr = await QRCode.toDataURL(qr);
-            isReady = false;
+            console.log(`✨ [Tienda ${storeId}] Nuevo QR generado.`);
+            currentSession.qr = await QRCode.toDataURL(qr);
+            currentSession.status = 'QR_READY';
         }
 
         if (connection === 'close') {
             const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log('❌ Conexión cerrada. ¿Reconectando?:', shouldReconnect);
-            isReady = false;
+            console.log(`❌ [Tienda ${storeId}] Conexión cerrada. ¿Reconectar?: ${shouldReconnect}`);
             
             if (shouldReconnect) {
-                setTimeout(() => { connectToWhatsApp(); }, 2000);
+                currentSession.status = 'RECONNECTING';
+                setTimeout(() => initSession(storeId), 2000);
             } else {
-                console.log('⚠️ Sesión cerrada. Debes borrar "baileys_auth_info" para escanear de nuevo.');
+                // El usuario cerró sesión desde su teléfono
+                console.log(`🗑️ [Tienda ${storeId}] Sesión cerrada manualmente. Borrando datos...`);
+                sessions.delete(storeId);
+                fs.rmSync(sessionPath, { recursive: true, force: true });
             }
         } else if (connection === 'open') {
-            console.log('✅ ¡Baileys Conectado y listo para volar! 🚀');
-            isReady = true;
-            latestQr = null;
+            console.log(`✅ [Tienda ${storeId}] ¡Conectado y listo!`);
+            currentSession.status = 'CONNECTED';
+            currentSession.qr = null; // Borramos el QR de la memoria
         }
     });
+
+    // Evitar que el bot colapse si le envían un mensaje raro
+    sock.ev.on('messages.upsert', () => {}); 
 }
 
-connectToWhatsApp();
-
-// --- 🌐 RUTAS WEB ---
-app.get('/qr', (req, res) => {
-    if (isReady) {
-        return res.send(`<div style="text-align:center; font-family:sans-serif; margin-top:100px;"><h1 style="color:#128c7e;">✅ Sistema Operativo</h1><p>CrumbCore está conectado a WhatsApp usando Baileys.</p></div>`);
-    }
-
-    if (latestQr) {
-        res.send(`<div style="text-align:center; font-family:sans-serif; margin-top:50px;"><h2 style="color:#128c7e;">Vincular WhatsApp (Baileys)</h2><img src="${latestQr}" style="width:300px; border:5px solid white; box-shadow:0 0 10px rgba(0,0,0,0.1);"><p>La página se refresca cada 15s automáticamente.</p><script>setTimeout(() => location.reload(), 15000);</script></div>`);
-    } else {
-        res.send('<h3 style="text-align:center; margin-top:50px;">Cargando motor ligero... recarga en 5 segs.</h3>');
+// --- 🔄 AUTO-ARRANQUE DE SESIONES GUARDADAS ---
+// Cuando Railway se reinicie, leemos las carpetas y encendemos los bots
+fs.readdirSync(AUTH_DIR).forEach(dir => {
+    if (dir.startsWith('store_')) {
+        const storeId = dir.split('_')[1];
+        console.log(`🔄 Restaurando sesión para Tienda ${storeId}...`);
+        initSession(storeId);
     }
 });
 
-app.post('/send', async (req, res) => {
-    if (!isReady) return res.status(503).json({ error: 'WhatsApp Offline' });
+// --- 🌐 ENDPOINTS DE LA API ---
+
+// 1. Iniciar/Consultar el estado de una tienda específica
+app.get('/session/:storeId', async (req, res) => {
+    const { storeId } = req.params;
     
-    const { phone, message, store_name } = req.body;
-    if (!phone || !message) return res.status(400).json({ error: 'Faltan datos' });
+    if (!sessions.has(storeId)) {
+        // Si no existe, la creamos en segundo plano
+        initSession(storeId);
+        return res.json({ status: 'STARTING', detail: 'Iniciando motor de WhatsApp...' });
+    }
+
+    const session = sessions.get(storeId);
+    res.json({ status: session.status, qr: session.qr });
+});
+
+// 2. Cerrar sesión remotamente
+app.delete('/session/:storeId', async (req, res) => {
+    const { storeId } = req.params;
+    if (sessions.has(storeId)) {
+        const session = sessions.get(storeId);
+        await session.sock.logout(); // Esto disparará el borrado de la carpeta
+        res.json({ success: true, detail: 'Sesión cerrada exitosamente.' });
+    } else {
+        res.json({ success: false, detail: 'No hay sesión activa.' });
+    }
+});
+
+// 3. Enviar mensaje usando LA CUENTA DE ESA TIENDA
+app.post('/send', async (req, res) => {
+    const { store_id, phone, message } = req.body;
+    
+    if (!store_id || !phone || !message) return res.status(400).json({ error: 'Faltan datos' });
+
+    const session = sessions.get(String(store_id));
+    
+    if (!session || session.status !== 'CONNECTED') {
+        return res.status(503).json({ error: 'El WhatsApp de esta tienda no está conectado.' });
+    }
 
     const cleanPhone = phone.replace(/\D/g, '');
-    const storeNameSafe = store_name || 'CrumbCore';
-    
-    // Mandamos a la cola
-    messageQueue.push({ phone: cleanPhone, message, storeNameSafe });
-    processQueue();
+    const jid = `${cleanPhone}@s.whatsapp.net`;
 
-    res.status(200).json({ status: 'queued', detail: `Mensaje recibido. Posición en cola: ${messageQueue.length}` });
+    try {
+        // En un futuro le inyectaremos la cola anti-baneo aquí mismo, 
+        // pero vamos a probar la conexión multi-tenant directa primero.
+        await session.sock.sendPresenceUpdate('composing', jid);
+        await new Promise(r => setTimeout(r, 1500));
+        await session.sock.sendPresenceUpdate('paused', jid);
+        
+        await session.sock.sendMessage(jid, { text: message });
+        
+        res.status(200).json({ status: 'sent', detail: 'Mensaje entregado' });
+    } catch (error) {
+        console.error(`❌ Error enviando a ${phone} desde tienda ${store_id}:`, error);
+        res.status(500).json({ error: 'Fallo al enviar' });
+    }
 });
 
-app.listen(process.env.PORT || 3000, () => console.log('🚀 Microservicio Baileys iniciado en el puerto 3000'));
+app.listen(process.env.PORT || 3000, () => console.log('🚀 API Multi-Tenant iniciada'));
