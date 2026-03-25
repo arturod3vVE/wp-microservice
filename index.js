@@ -69,11 +69,9 @@ async function initSession(storeId) {
     sock.ev.on('messages.upsert', () => {}); 
 }
 
-// --- 🔄 AUTO-ARRANQUE DE SESIONES GUARDADAS ---
-// Cuando Railway se reinicie, leemos las carpetas y encendemos los bots
 fs.readdirSync(AUTH_DIR).forEach(dir => {
     if (dir.startsWith('store_')) {
-        const storeId = dir.split('_')[1];
+        const storeId = dir.substring(6); 
         console.log(`🔄 Restaurando sesión para Tienda ${storeId}...`);
         initSession(storeId);
     }
