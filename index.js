@@ -1,36 +1,84 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, Browsers } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, DisconnectReason, fetchLatestBaileysVersion, Browsers, BufferJSON, initAuthCreds } = require('@whiskeysockets/baileys');
+const { MongoClient } = require('mongodb');
 const express = require('express');
 const QRCode = require('qrcode');
 const pino = require('pino');
-const fs = require('fs');
-const path = require('path');
 
 const app = express();
 app.use(express.json());
 
-// 🗂️ DICCIONARIO DE SESIONES ACTIVAS
-// Aquí guardaremos { sock, qr, status } para cada store_id
-const sessions = new Map(); 
+const MONGO_URI = process.env.MONGO_URI; // Configura esto en Render
+const client = new MongoClient(MONGO_URI);
+let db;
 
-// Ruta base del volumen de Railway
-const AUTH_DIR = '/app/baileys_auth_info';
-if (!fs.existsSync(AUTH_DIR)) fs.mkdirSync(AUTH_DIR, { recursive: true });
+const sessions = new Map();
+
+// --- 🛠️ ADAPTADOR DE MONGODB PARA BAILEYS ---
+async function useMongoDBAuthState(storeId) {
+    const collection = db.collection(`session_${storeId}`);
+
+    const writeData = (data, id) => {
+        return collection.replaceOne({ _id: id }, JSON.parse(JSON.stringify(data, BufferJSON.replacer)), { upsert: true });
+    };
+
+    const readData = async (id) => {
+        try {
+            const data = await collection.findOne({ _id: id });
+            return JSON.parse(JSON.stringify(data), BufferJSON.reviver);
+        } catch (error) { return null; }
+    };
+
+    const removeData = async (id) => {
+        try { await collection.deleteOne({ _id: id }); } catch (error) { }
+    };
+
+    const creds = (await readData('creds')) || initAuthCreds();
+
+    return {
+        state: {
+            creds,
+            keys: {
+                get: async (type, ids) => {
+                    const data = {};
+                    await Promise.all(ids.map(async (id) => {
+                        let value = await readData(`${type}-${id}`);
+                        if (type === 'app-state-sync-key' && value) {
+                            value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                        }
+                        data[id] = value;
+                    }));
+                    return data;
+                },
+                set: async (data) => {
+                    const tasks = [];
+                    for (const category in data) {
+                        for (const id in data[category]) {
+                            const value = data[category][id];
+                            const sId = `${category}-${id}`;
+                            tasks.push(value ? writeData(value, sId) : removeData(sId));
+                        }
+                    }
+                    await Promise.all(tasks);
+                }
+            }
+        },
+        saveCreds: () => writeData(creds, 'creds')
+    };
+}
 
 // --- ⚙️ MOTOR CREADOR DE SESIONES ---
 async function initSession(storeId) {
-    const sessionPath = path.join(AUTH_DIR, `store_${storeId}`);
-    const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+    const { state, saveCreds } = await useMongoDBAuthState(storeId);
     const { version } = await fetchLatestBaileysVersion();
 
     const sock = makeWASocket({
         version,
         auth: state,
         printQRInTerminal: false,
-        logger: pino({ level: 'silent' }), 
+        logger: pino({ level: 'silent' }),
         browser: Browsers.macOS('Desktop')
     });
 
-    // Guardamos la sesión en el mapa con estado inicial
     sessions.set(storeId, { sock, status: 'STARTING', qr: null });
 
     sock.ev.on('creds.update', saveCreds);
@@ -40,49 +88,49 @@ async function initSession(storeId) {
         const currentSession = sessions.get(storeId);
 
         if (qr) {
-            console.log(`✨ [Tienda ${storeId}] Nuevo QR generado.`);
             currentSession.qr = await QRCode.toDataURL(qr);
             currentSession.status = 'QR_READY';
         }
 
         if (connection === 'close') {
             const shouldReconnect = lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log(`❌ [Tienda ${storeId}] Conexión cerrada. ¿Reconectar?: ${shouldReconnect}`);
-            
             if (shouldReconnect) {
-                currentSession.status = 'RECONNECTING';
-                setTimeout(() => initSession(storeId), 2000);
+                setTimeout(() => initSession(storeId), 3000);
             } else {
-                // El usuario cerró sesión desde su teléfono
-                console.log(`🗑️ [Tienda ${storeId}] Sesión cerrada manualmente. Borrando datos...`);
                 sessions.delete(storeId);
-                fs.rmSync(sessionPath, { recursive: true, force: true });
+                await db.collection(`session_${storeId}`).drop();
             }
         } else if (connection === 'open') {
-            console.log(`✅ [Tienda ${storeId}] ¡Conectado y listo!`);
             currentSession.status = 'CONNECTED';
-            currentSession.qr = null; // Borramos el QR de la memoria
+            currentSession.qr = null;
         }
     });
-
-    // Evitar que el bot colapse si le envían un mensaje raro
-    sock.ev.on('messages.upsert', () => {}); 
 }
 
-fs.readdirSync(AUTH_DIR).forEach(dir => {
-    if (dir.startsWith('store_')) {
-        const storeId = dir.substring(6); 
-        console.log(`🔄 Restaurando sesión para Tienda ${storeId}...`);
-        initSession(storeId);
+// --- 🚀 INICIO DEL SERVIDOR ---
+async function startServer() {
+    await client.connect();
+    db = client.db('whatsapp_bot');
+    console.log('✅ Conectado a MongoDB Atlas');
+
+    // Restaurar sesiones automáticas desde la DB
+    const collections = await db.listCollections().toArray();
+    for (const col of collections) {
+        if (col.name.startsWith('session_')) {
+            const storeId = col.name.replace('session_', '');
+            initSession(storeId);
+        }
     }
-});
+
+    app.listen(process.env.PORT || 3000, () => console.log('🚀 API lista'));
+}
 
 // --- 🌐 ENDPOINTS DE LA API ---
 
 // 1. Iniciar/Consultar el estado de una tienda específica
 app.get('/session/:storeId', async (req, res) => {
     const { storeId } = req.params;
-    
+
     if (!sessions.has(storeId)) {
         // Si no existe, la creamos en segundo plano
         initSession(storeId);
@@ -108,11 +156,11 @@ app.delete('/session/:storeId', async (req, res) => {
 // 3. Enviar mensaje usando LA CUENTA DE ESA TIENDA
 app.post('/send', async (req, res) => {
     const { store_id, phone, message } = req.body;
-    
+
     if (!store_id || !phone || !message) return res.status(400).json({ error: 'Faltan datos' });
 
     const session = sessions.get(String(store_id));
-    
+
     if (!session || session.status !== 'CONNECTED') {
         return res.status(503).json({ error: 'El WhatsApp de esta tienda no está conectado.' });
     }
@@ -126,9 +174,9 @@ app.post('/send', async (req, res) => {
         await session.sock.sendPresenceUpdate('composing', jid);
         await new Promise(r => setTimeout(r, 1500));
         await session.sock.sendPresenceUpdate('paused', jid);
-        
+
         await session.sock.sendMessage(jid, { text: message });
-        
+
         res.status(200).json({ status: 'sent', detail: 'Mensaje entregado' });
     } catch (error) {
         console.error(`❌ Error enviando a ${phone} desde tienda ${store_id}:`, error);
@@ -136,4 +184,4 @@ app.post('/send', async (req, res) => {
     }
 });
 
-app.listen(process.env.PORT || 3000, () => console.log('🚀 API Multi-Tenant iniciada'));
+startServer();
